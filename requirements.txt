@@ -9,6 +9,7 @@ cachetools==7.1.0
 caio==0.9.25
 certifi==2026.4.22
 cffi==2.0.0
+curl_cffi==0.15.0
 click==8.3.3
 colorama==0.4.6
 cryptography==47.0.0

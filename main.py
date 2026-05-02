@@ -2,6 +2,9 @@ from fastmcp import FastMCP
 from dotenv import load_dotenv
 import os
 
+from fhir_client import FHIRClient, FHIRError
+from trials_client import TrialsClient, TrialsError, extract_condition_terms
+
 load_dotenv()
 
 mcp = FastMCP("clinical-trial-matcher")
@@ -10,25 +13,53 @@ mcp = FastMCP("clinical-trial-matcher")
 @mcp.tool()
 async def match_trials(
     fhir_base_url: str,
-    fhir_access_token: str,
-    max_results: int = 5
+    patient_id: str,
+    fhir_access_token: str = "",
+    max_results: int = 10,
 ) -> dict:
     """
     Matches a patient to open clinical trials using their FHIR record.
-    Returns ranked trials with AI-assessed eligibility scores.
+    Fetches the patient bundle from a FHIR R4 server, extracts conditions,
+    queries ClinicalTrials.gov for recruiting trials, and returns the raw list.
 
     Args:
-        fhir_base_url: Base URL of the FHIR server (from SHARP context)
-        fhir_access_token: Bearer token for FHIR server auth (from SHARP context)
-        max_results: Maximum number of trial matches to return (default 5)
+        fhir_base_url: Base URL of the FHIR server (e.g. https://hapi.fhir.org/baseR4)
+        patient_id: FHIR Patient resource ID
+        fhir_access_token: Bearer token for FHIR server auth (omit for public servers)
+        max_results: Maximum number of trial matches to return (default 10)
     """
-    # TODO Day 2: fetch FHIR patient bundle
-    # TODO Day 3: query ClinicalTrials.gov
-    # TODO Day 4: AI eligibility reasoning
+    # ── 1. Fetch FHIR patient bundle ──────────────────────────────────────────
+    try:
+        async with FHIRClient(fhir_base_url, fhir_access_token or None) as fhir:
+            bundle = await fhir.get_patient_bundle(patient_id)
+    except FHIRError as exc:
+        return {"status": "error", "source": "fhir", "message": str(exc), "trials": []}
+
+    # ── 2. Extract condition search terms from the bundle ─────────────────────
+    condition_terms = extract_condition_terms(bundle["conditions"])
+
+    # ── 3. Query ClinicalTrials.gov ───────────────────────────────────────────
+    try:
+        async with TrialsClient() as trials:
+            trial_list = await trials.search(condition_terms, max_results=max_results)
+    except TrialsError as exc:
+        return {
+            "status": "error",
+            "source": "clinicaltrials",
+            "message": str(exc),
+            "condition_search_terms": condition_terms,
+            "bundle_summary": _bundle_summary(bundle),
+            "trials": [],
+        }
+
+    # ── 4. TODO Day 4: AI eligibility scoring ─────────────────────────────────
     return {
-        "status": "stub",
-        "message": "match_trials tool registered successfully",
-        "trials": []
+        "status": "ok",
+        "patient_id": patient_id,
+        "condition_search_terms": condition_terms,
+        "bundle_summary": _bundle_summary(bundle),
+        "total_trials_found": len(trial_list),
+        "trials": trial_list,
     }
 
 
@@ -36,7 +67,8 @@ async def match_trials(
 async def explain_eligibility(
     nct_id: str,
     fhir_base_url: str,
-    fhir_access_token: str
+    patient_id: str,
+    fhir_access_token: str = "",
 ) -> dict:
     """
     Returns a criterion-by-criterion eligibility breakdown for a specific
@@ -44,14 +76,23 @@ async def explain_eligibility(
 
     Args:
         nct_id: The ClinicalTrials.gov NCT identifier (e.g. NCT04567890)
-        fhir_base_url: Base URL of the FHIR server (from SHARP context)
-        fhir_access_token: Bearer token for FHIR server auth (from SHARP context)
+        fhir_base_url: Base URL of the FHIR server
+        patient_id: FHIR Patient resource ID
+        fhir_access_token: Bearer token for FHIR server auth (omit for public servers)
     """
-    # TODO Day 5: fetch trial criteria + patient bundle, run AI breakdown
+    try:
+        async with FHIRClient(fhir_base_url, fhir_access_token or None) as fhir:
+            bundle = await fhir.get_patient_bundle(patient_id)
+    except FHIRError as exc:
+        return {"status": "error", "message": str(exc), "nct_id": nct_id, "criteria_breakdown": []}
+
+    # TODO Day 5: fetch trial criteria from ClinicalTrials.gov + run AI breakdown
     return {
-        "status": "stub",
+        "status": "ok",
         "nct_id": nct_id,
-        "criteria_breakdown": []
+        "patient_id": patient_id,
+        "bundle_summary": _bundle_summary(bundle),
+        "criteria_breakdown": [],
     }
 
 
@@ -68,7 +109,27 @@ async def get_trial_details(nct_id: str) -> dict:
     return {
         "status": "stub",
         "nct_id": nct_id,
-        "details": {}
+        "details": {},
+    }
+
+
+def _bundle_summary(bundle: dict) -> dict:
+    patient = bundle["patient"]
+    name_parts = []
+    for n in patient.get("name", []):
+        family = n.get("family", "")
+        given = " ".join(n.get("given", []))
+        name_parts.append(f"{given} {family}".strip())
+
+    return {
+        "patient_name": name_parts[0] if name_parts else "unknown",
+        "birth_date": patient.get("birthDate", ""),
+        "gender": patient.get("gender", ""),
+        "conditions": len(bundle["conditions"]),
+        "observations": len(bundle["observations"]),
+        "medications": len(bundle["medications"]),
+        "allergies": len(bundle["allergies"]),
+        "procedures": len(bundle["procedures"]),
     }
 
 
