@@ -1,11 +1,14 @@
+import asyncio
+
 from fastmcp import FastMCP
 from dotenv import load_dotenv
 import os
 
 from fhir_client import FHIRClient, FHIRError
 from trials_client import TrialsClient, TrialsError, extract_condition_terms
+from reasoning import assess_eligibility
 
-load_dotenv()
+load_dotenv(encoding="utf-8-sig")  # utf-8-sig strips BOM if present
 
 mcp = FastMCP("clinical-trial-matcher")
 
@@ -52,7 +55,25 @@ async def match_trials(
             "trials": [],
         }
 
-    # ── 4. TODO Day 4: AI eligibility scoring ─────────────────────────────────
+    # ── 4. AI eligibility reasoning (all trials in parallel) ─────────────────
+    scores = await asyncio.gather(
+        *[assess_eligibility(bundle, t) for t in trial_list],
+        return_exceptions=True,
+    )
+    for trial, score in zip(trial_list, scores):
+        if isinstance(score, Exception):
+            trial["eligibility"] = {
+                "match_score": 0, "verdict": "uncertain",
+                "key_matches": [], "key_barriers": [], "unknown_criteria": [],
+                "reasoning_summary": f"Reasoning failed: {score}",
+            }
+        else:
+            trial["eligibility"] = score
+
+    trial_list.sort(
+        key=lambda t: t["eligibility"].get("match_score", 0), reverse=True
+    )
+
     return {
         "status": "ok",
         "patient_id": patient_id,
