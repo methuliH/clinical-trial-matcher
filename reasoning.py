@@ -1,6 +1,7 @@
 """
-AI eligibility reasoning via the xAI Grok API (OpenAI-compatible interface).
+AI eligibility reasoning via the Groq API (OpenAI-compatible interface).
 """
+import asyncio
 import json
 import os
 import re
@@ -8,11 +9,14 @@ from datetime import date
 
 from openai import AsyncOpenAI
 
-GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
-GEMINI_MODEL = "gemini-2.5-flash"
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+GROQ_MODEL = "llama-3.3-70b-versatile"
 
 # Cap eligibility criteria fed to the model to avoid token blowout on huge trials.
 _MAX_CRITERIA_CHARS = 6000
+
+# Serialise calls to stay comfortably within Groq's free-tier RPM limit.
+_call_lock = asyncio.Lock()
 
 _SYSTEM_PROMPT = (
     "You are an expert oncology clinical trial matching specialist. "
@@ -56,15 +60,15 @@ _VALID_VERDICTS = frozenset(
 
 async def assess_eligibility(bundle: dict, trial: dict) -> dict:
     """
-    Ask Grok to reason through a trial's eligibility criteria against a patient bundle.
+    Ask Groq to reason through a trial's eligibility criteria against a patient bundle.
 
     Returns a normalised dict with keys:
         match_score, verdict, key_matches, key_barriers,
         unknown_criteria, reasoning_summary
     """
-    api_key = os.environ.get("GEMINI_API_KEY")
+    api_key = os.environ.get("GROQ_API_KEY")
     if not api_key:
-        return _error_result("GEMINI_API_KEY environment variable is not set")
+        return _error_result("GROQ_API_KEY environment variable is not set")
 
     criteria = trial.get("eligibility_criteria", "") or "(eligibility criteria not available)"
     if len(criteria) > _MAX_CRITERIA_CHARS:
@@ -80,16 +84,17 @@ async def assess_eligibility(bundle: dict, trial: dict) -> dict:
     )
 
     try:
-        async with AsyncOpenAI(base_url=GEMINI_BASE_URL, api_key=api_key) as client:
-            resp = await client.chat.completions.create(
-                model=GEMINI_MODEL,
-                messages=[
-                    {"role": "system", "content": _SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.1,
-            )
+        async with _call_lock:
+            async with AsyncOpenAI(base_url=GROQ_BASE_URL, api_key=api_key, timeout=120.0) as client:
+                resp = await client.chat.completions.create(
+                    model=GROQ_MODEL,
+                    messages=[
+                        {"role": "system", "content": _SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt},
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0.1,
+                )
         raw_text = resp.choices[0].message.content or ""
     except Exception as exc:  # noqa: BLE001
         return _error_result(str(exc))
@@ -102,7 +107,6 @@ async def assess_eligibility(bundle: dict, trial: dict) -> dict:
 def _patient_summary(bundle: dict) -> str:
     patient = bundle["patient"]
 
-    # Age
     birth_date = patient.get("birthDate", "")
     age_str = "unknown age"
     if birth_date:
@@ -117,11 +121,28 @@ def _patient_summary(bundle: dict) -> str:
             pass
     gender = patient.get("gender", "unknown")
 
-    lines = [f"{age_str} {gender}\n"]
+    lines = [f"PATIENT: {age_str} {gender}"]
 
-    # Diagnoses
+    # ── Molecular biomarkers first — these are the most eligibility-critical ──
+    mol_obs = [
+        o for o in bundle["observations"]
+        if any(
+            c.get("code") in ("69548-6", "81311-2", "85319-2", "51194-4", "85318-4")
+            for c in o.get("code", {}).get("coding", [])
+        )
+    ]
+    perf_obs = [o for o in bundle["observations"] if o not in mol_obs]
+
+    if mol_obs:
+        lines.append("\nMOLECULAR BIOMARKERS (*** READ CAREFULLY — CRITICAL FOR ELIGIBILITY ***):")
+        for obs in mol_obs:
+            label = obs["_label"]
+            value = obs["_value"]
+            lines.append(f"  *** {label}: {value if value else '(no value recorded)'} ***")
+
+    # ── Diagnoses ──────────────────────────────────────────────────────────────
     if bundle["conditions"]:
-        lines.append("DIAGNOSES:")
+        lines.append("\nDIAGNOSES:")
         for cond in bundle["conditions"]:
             code = cond.get("code", {})
             label = code.get("text") or _first_display(code.get("coding", []))
@@ -143,17 +164,16 @@ def _patient_summary(bundle: dict) -> str:
                 line += f"  [{clinical_status}]"
             lines.append(line)
 
-    # Biomarkers / clinical status
-    if bundle["observations"]:
-        lines.append("\nBIOMARKERS / CLINICAL STATUS:")
-        for obs in bundle["observations"]:
-            code = obs.get("code", {})
-            label = code.get("text") or _first_display(code.get("coding", []))
-            value = _obs_value(obs)
+    # ── Performance / other clinical observations ──────────────────────────────
+    if perf_obs:
+        lines.append("\nCLINICAL STATUS:")
+        for obs in perf_obs:
+            label = obs["_label"]
+            value = obs["_value"]
             if label:
                 lines.append(f"  - {label}: {value}" if value else f"  - {label}: (no value)")
 
-    # Prior / current treatments
+    # ── Prior / current treatments ─────────────────────────────────────────────
     if bundle["medications"]:
         lines.append("\nPRIOR / CURRENT TREATMENTS:")
         for med in bundle["medications"]:
@@ -164,7 +184,7 @@ def _patient_summary(bundle: dict) -> str:
             detail = ", ".join(filter(None, [status, authored]))
             lines.append(f"  - {name} ({detail})" if detail else f"  - {name}")
 
-    # Allergies
+    # ── Allergies ──────────────────────────────────────────────────────────────
     if bundle["allergies"]:
         lines.append("\nALLERGIES:")
         for allergy in bundle["allergies"]:
@@ -173,7 +193,7 @@ def _patient_summary(bundle: dict) -> str:
             if substance:
                 lines.append(f"  - {substance}")
 
-    # Procedures
+    # ── Procedures ─────────────────────────────────────────────────────────────
     if bundle["procedures"]:
         lines.append("\nPROCEDURES:")
         for proc in bundle["procedures"]:
@@ -196,20 +216,8 @@ def _first_display(coding_list: list[dict]) -> str:
     return ""
 
 
-def _obs_value(obs: dict) -> str:
-    if "valueQuantity" in obs:
-        vq = obs["valueQuantity"]
-        return f"{vq.get('value', '')} {vq.get('unit', '')}".strip()
-    if "valueCodeableConcept" in obs:
-        vcc = obs["valueCodeableConcept"]
-        return vcc.get("text") or _first_display(vcc.get("coding", []))
-    if "valueString" in obs:
-        return obs["valueString"]
-    return ""
-
 
 def _parse_response(raw: str) -> dict:
-    # Strip markdown fences if present
     raw = raw.strip()
     if raw.startswith("```"):
         raw = re.sub(r"^```[a-zA-Z]*\n?", "", raw)

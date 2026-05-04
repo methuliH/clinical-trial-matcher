@@ -8,6 +8,9 @@ Run from your local terminal (ClinicalTrials.gov blocks some cloud IPs):
 import argparse
 import asyncio
 import json
+import sys
+
+sys.stdout.reconfigure(encoding="utf-8")
 
 from main import match_trials
 
@@ -38,10 +41,15 @@ async def run(patient_id: str, max_results: int):
     print(f"\n=== Condition search terms sent to ClinicalTrials.gov ===")
     print(json.dumps(result["condition_search_terms"], indent=2))
 
+    HIGHLIGHT = {"NCT05401110", "NCT06864624"}
+
     print(f"\n=== Recruiting trials found: {result['total_trials_found']} ===")
     for i, trial in enumerate(result["trials"], 1):
-        print(f"\n--- Trial {i} ---")
-        print(f"  NCT ID  : {trial['nct_id']}")
+        nct = trial["nct_id"]
+        marker = " ★ REQUESTED" if nct in HIGHLIGHT else ""
+        print(f"\n{'='*60}")
+        print(f"--- Trial {i}{marker} ---")
+        print(f"  NCT ID  : {nct}")
         print(f"  Title   : {trial['title']}")
         print(f"  Phase   : {trial['phase']}")
         print(f"  Sponsor : {trial['sponsor']}")
@@ -52,6 +60,27 @@ async def run(patient_id: str, max_results: int):
                 print(f"            - {loc}")
         crit = trial["eligibility_criteria"]
         print(f"  Criteria: {crit[:300]}{'...' if len(crit) > 300 else ''}")
+
+        elig = trial.get("eligibility", {})
+        print(f"\n  --- Eligibility Reasoning ---")
+        print(f"  Match Score : {elig.get('match_score', 'N/A')} / 100")
+        print(f"  Verdict     : {elig.get('verdict', 'N/A')}")
+        matches = elig.get("key_matches") or []
+        barriers = elig.get("key_barriers") or []
+        unknowns = elig.get("unknown_criteria") or []
+        if matches:
+            print(f"  Key Matches :")
+            for m in matches:
+                print(f"    [+] {m}")
+        if barriers:
+            print(f"  Key Barriers:")
+            for b in barriers:
+                print(f"    [-] {b}")
+        if unknowns:
+            print(f"  Unknown     :")
+            for u in unknowns:
+                print(f"    ? {u}")
+        print(f"  Summary     : {elig.get('reasoning_summary', 'N/A')}")
 
 
 if __name__ == "__main__":

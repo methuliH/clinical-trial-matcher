@@ -27,6 +27,25 @@ class TrialsClient:
     async def __aexit__(self, *args):
         await self.close()
 
+    async def get_by_nct_id(self, nct_id: str) -> dict | None:
+        """Fetch a single trial by NCT ID. Returns None if not found."""
+        try:
+            resp = await self._session.get(
+                f"{CTGOV_V2}/{nct_id}",
+                params={"format": "json"},
+                timeout=self._timeout,
+            )
+            resp.raise_for_status()
+        except Timeout as exc:
+            raise TrialsError(f"Timeout fetching {nct_id}") from exc
+        except HTTPError as exc:
+            if exc.response.status_code == 404:
+                return None
+            raise TrialsError(f"HTTP {exc.response.status_code} fetching {nct_id}") from exc
+        except RequestException as exc:
+            raise TrialsError(f"Request failed fetching {nct_id}: {exc}") from exc
+        return _parse_study(resp.json())
+
     async def search(self, conditions: list[str], max_results: int = 10) -> list[dict]:
         """
         Search for RECRUITING trials matching any of the given condition terms.

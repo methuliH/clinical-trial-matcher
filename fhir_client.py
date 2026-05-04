@@ -4,6 +4,35 @@ from typing import Optional
 import httpx
 
 
+def _obs_label(obs: dict) -> str:
+    code = obs.get("code", {})
+    return code.get("text") or next(
+        (c["display"] for c in code.get("coding", []) if c.get("display")), ""
+    )
+
+
+def _obs_value_text(obs: dict) -> str:
+    """Extract a human-readable value string from any FHIR Observation value type."""
+    if "valueQuantity" in obs:
+        vq = obs["valueQuantity"]
+        return f"{vq.get('value', '')} {vq.get('unit', '')}".strip()
+    if "valueCodeableConcept" in obs:
+        vcc = obs["valueCodeableConcept"]
+        return vcc.get("text") or next(
+            (c["display"] for c in vcc.get("coding", []) if c.get("display")), ""
+        )
+    if "valueString" in obs:
+        return obs["valueString"]
+    if "valueBoolean" in obs:
+        return str(obs["valueBoolean"])
+    return ""
+
+
+def normalize_observation(obs: dict) -> dict:
+    """Return the raw obs dict augmented with _label and _value for easy downstream access."""
+    return {**obs, "_label": _obs_label(obs), "_value": _obs_value_text(obs)}
+
+
 class FHIRError(Exception):
     def __init__(self, status_code: int, message: str):
         self.status_code = status_code
@@ -96,7 +125,7 @@ class FHIRClient:
         return {
             "patient": patient,
             "conditions": conditions,
-            "observations": observations,
+            "observations": [normalize_observation(o) for o in observations],
             "medications": medications,
             "allergies": allergies,
             "procedures": procedures,

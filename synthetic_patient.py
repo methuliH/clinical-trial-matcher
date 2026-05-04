@@ -63,7 +63,7 @@ async def create_synthetic_patient(fhir_url: str) -> dict:
         pref = f"Patient/{pid}"
         print(f"  Patient:              {pref}")
 
-        # ── Condition: NSCLC Stage IIIB ───────────────────────────────────────
+        # ── Condition: NSCLC Stage IV ─────────────────────────────────────────
         condition = await _post(client, f"{base}/Condition", {
             "resourceType": "Condition",
             "clinicalStatus": {"coding": [{
@@ -85,14 +85,14 @@ async def create_synthetic_patient(fhir_url: str) -> dict:
                     {"system": "http://hl7.org/fhir/sid/icd-10-cm", "code": "C34.10",
                      "display": "Malignant neoplasm of upper lobe, unspecified bronchus or lung"},
                 ],
-                "text": "Non-Small Cell Lung Cancer (NSCLC), Stage IIIB",
+                "text": "Non-Small Cell Lung Cancer (NSCLC), Stage IV",
             },
             "subject": {"reference": pref},
             "onsetDateTime": "2024-09-01",
             "stage": [{"summary": {"coding": [{
                 "system": "http://snomed.info/sct",
-                "code": "1229954006",
-                "display": "Stage IIIB",
+                "code": "258224005",
+                "display": "Stage IV",
             }]}}],
         })
         cref = f"Condition/{condition['id']}"
@@ -145,7 +145,7 @@ async def create_synthetic_patient(fhir_url: str) -> dict:
         })
         print(f"  Observation (PD-L1):  Observation/{pdl1['id']}")
 
-        # ── Observation: EGFR mutation – negative ─────────────────────────────
+        # ── Observation: EGFR Exon 19 deletion (positive) ────────────────────
         egfr = await _post(client, f"{base}/Observation", {
             "resourceType": "Observation",
             "status": "final",
@@ -154,16 +154,20 @@ async def create_synthetic_patient(fhir_url: str) -> dict:
                 "code": "laboratory",
             }]}],
             "code": {
-                "coding": [{"system": "http://loinc.org", "code": "81311-2",
-                             "display": "EGFR gene mutation analysis"}],
+                "coding": [{"system": "http://loinc.org", "code": "69548-6",
+                             "display": "Genetic variant assessment"}],
                 "text": "EGFR Mutation Status",
             },
             "subject": {"reference": pref},
             "effectiveDateTime": "2024-10-05",
             "valueCodeableConcept": {
-                "coding": [{"system": "http://snomed.info/sct", "code": "260385009",
-                             "display": "Negative"}],
-                "text": "EGFR Mutation Negative",
+                "coding": [
+                    {"system": "http://loinc.org", "code": "LA9633-4",
+                     "display": "Present"},
+                    {"system": "http://snomed.info/sct", "code": "413084006",
+                     "display": "Exon 19 deletion mutation"},
+                ],
+                "text": "EGFR mutation positive (Exon 19 deletion)",
             },
         })
         print(f"  Observation (EGFR):   Observation/{egfr['id']}")
