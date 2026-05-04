@@ -12,11 +12,58 @@ load_dotenv(encoding="utf-8-sig")  # utf-8-sig strips BOM if present
 
 mcp = FastMCP("clinical-trial-matcher")
 
+# ── SHARP/FHIR context capability ────────────────────────────────────────────
+# Advertise the ai.promptopinion/fhir-context extension so SMART-on-FHIR
+# clients (e.g. Prompt Opinion) know which FHIR scopes this server needs and
+# can inject FHIR context via HTTP headers instead of requiring explicit params.
+
+_FHIR_SCOPES = [
+    "patient/Patient.rs",
+    "patient/Condition.rs",
+    "patient/Observation.rs",
+    "patient/MedicationRequest.rs",
+    "patient/AllergyIntolerance.rs",
+    "patient/Procedure.rs",
+]
+
+_orig_get_caps = mcp._mcp_server.get_capabilities
+
+
+def _get_caps_with_fhir(notification_options, experimental_capabilities):
+    caps = _orig_get_caps(notification_options, experimental_capabilities)
+    existing = caps.experimental or {}
+    caps.experimental = {
+        **existing,
+        "ai.promptopinion/fhir-context": {"requiredScopes": _FHIR_SCOPES},
+    }
+    return caps
+
+
+mcp._mcp_server.get_capabilities = _get_caps_with_fhir
+
+
+# ── Header helper ─────────────────────────────────────────────────────────────
+
+def _fhir_headers() -> dict:
+    """Return FHIR context from HTTP headers; empty strings when unavailable."""
+    try:
+        from fastmcp.server.dependencies import get_http_request
+        req = get_http_request()
+        return {
+            "fhir_base_url": req.headers.get("x-fhir-server-url", ""),
+            "patient_id": req.headers.get("x-patient-id", ""),
+            "fhir_access_token": req.headers.get("x-fhir-access-token", ""),
+        }
+    except RuntimeError:
+        return {"fhir_base_url": "", "patient_id": "", "fhir_access_token": ""}
+
+
+# ── Tools ─────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
 async def match_trials(
-    fhir_base_url: str,
-    patient_id: str,
+    fhir_base_url: str = "",
+    patient_id: str = "",
     fhir_access_token: str = "",
     max_results: int = 10,
 ) -> dict:
@@ -25,12 +72,29 @@ async def match_trials(
     Fetches the patient bundle from a FHIR R4 server, extracts conditions,
     queries ClinicalTrials.gov for recruiting trials, and returns the raw list.
 
+    FHIR context can be supplied either as explicit parameters or via HTTP headers
+    (X-FHIR-Server-URL, X-Patient-ID, X-FHIR-Access-Token). Headers take
+    precedence when both are provided.
+
     Args:
         fhir_base_url: Base URL of the FHIR server (e.g. https://hapi.fhir.org/baseR4)
         patient_id: FHIR Patient resource ID
         fhir_access_token: Bearer token for FHIR server auth (omit for public servers)
         max_results: Maximum number of trial matches to return (default 10)
     """
+    h = _fhir_headers()
+    fhir_base_url = h["fhir_base_url"] or fhir_base_url
+    patient_id = h["patient_id"] or patient_id
+    fhir_access_token = h["fhir_access_token"] or fhir_access_token
+
+    if not fhir_base_url or not patient_id:
+        return {
+            "status": "error",
+            "source": "params",
+            "message": "fhir_base_url and patient_id are required (via params or headers)",
+            "trials": [],
+        }
+
     # ── 1. Fetch FHIR patient bundle ──────────────────────────────────────────
     try:
         async with FHIRClient(fhir_base_url, fhir_access_token or None) as fhir:
@@ -87,13 +151,17 @@ async def match_trials(
 @mcp.tool()
 async def explain_eligibility(
     nct_id: str,
-    fhir_base_url: str,
-    patient_id: str,
+    fhir_base_url: str = "",
+    patient_id: str = "",
     fhir_access_token: str = "",
 ) -> dict:
     """
     Returns a criterion-by-criterion eligibility breakdown for a specific
     clinical trial against the patient's FHIR record.
+
+    FHIR context can be supplied either as explicit parameters or via HTTP headers
+    (X-FHIR-Server-URL, X-Patient-ID, X-FHIR-Access-Token). Headers take
+    precedence when both are provided.
 
     Args:
         nct_id: The ClinicalTrials.gov NCT identifier (e.g. NCT04567890)
@@ -101,6 +169,19 @@ async def explain_eligibility(
         patient_id: FHIR Patient resource ID
         fhir_access_token: Bearer token for FHIR server auth (omit for public servers)
     """
+    h = _fhir_headers()
+    fhir_base_url = h["fhir_base_url"] or fhir_base_url
+    patient_id = h["patient_id"] or patient_id
+    fhir_access_token = h["fhir_access_token"] or fhir_access_token
+
+    if not fhir_base_url or not patient_id:
+        return {
+            "status": "error",
+            "message": "fhir_base_url and patient_id are required (via params or headers)",
+            "nct_id": nct_id,
+            "criteria_breakdown": [],
+        }
+
     try:
         async with FHIRClient(fhir_base_url, fhir_access_token or None) as fhir:
             bundle = await fhir.get_patient_bundle(patient_id)
