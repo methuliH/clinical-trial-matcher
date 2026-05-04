@@ -6,7 +6,7 @@ import os
 
 from fhir_client import FHIRClient, FHIRError
 from trials_client import TrialsClient, TrialsError, extract_condition_terms
-from reasoning import assess_eligibility
+from reasoning import assess_eligibility, breakdown_eligibility
 
 load_dotenv(encoding="utf-8-sig")  # utf-8-sig strips BOM if present
 
@@ -107,13 +107,26 @@ async def explain_eligibility(
     except FHIRError as exc:
         return {"status": "error", "message": str(exc), "nct_id": nct_id, "criteria_breakdown": []}
 
-    # TODO Day 5: fetch trial criteria from ClinicalTrials.gov + run AI breakdown
+    try:
+        async with TrialsClient() as trials:
+            trial = await trials.get_by_nct_id(nct_id)
+    except TrialsError as exc:
+        return {"status": "error", "message": str(exc), "nct_id": nct_id, "criteria_breakdown": []}
+
+    if trial is None:
+        return {"status": "error", "message": f"{nct_id} not found on ClinicalTrials.gov",
+                "nct_id": nct_id, "criteria_breakdown": []}
+
+    criteria_breakdown = await breakdown_eligibility(bundle, trial)
+
     return {
         "status": "ok",
         "nct_id": nct_id,
         "patient_id": patient_id,
+        "trial_title": trial["title"],
         "bundle_summary": _bundle_summary(bundle),
-        "criteria_breakdown": [],
+        "total_criteria_evaluated": len(criteria_breakdown),
+        "criteria_breakdown": criteria_breakdown,
     }
 
 

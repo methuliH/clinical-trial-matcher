@@ -14,9 +14,13 @@ GROQ_MODEL = "llama-3.3-70b-versatile"
 
 # Cap eligibility criteria fed to the model to avoid token blowout on huge trials.
 _MAX_CRITERIA_CHARS = 6000
+# Max individual criteria sent in a single breakdown call.
+_MAX_CRITERIA_COUNT = 25
 
 # Serialise calls to stay comfortably within Groq's free-tier RPM limit.
 _call_lock = asyncio.Lock()
+
+_VALID_BREAKDOWN_VERDICTS = frozenset({"met", "not_met", "unknown"})
 
 _SYSTEM_PROMPT = (
     "You are an expert oncology clinical trial matching specialist. "
@@ -54,6 +58,34 @@ Return a JSON object with EXACTLY these fields:
 _VALID_VERDICTS = frozenset(
     {"eligible", "likely_eligible", "uncertain", "likely_ineligible", "ineligible"}
 )
+
+_BREAKDOWN_SYSTEM_PROMPT = (
+    "You are an expert oncology clinical trial eligibility specialist. "
+    "Evaluate each numbered criterion individually against the patient profile provided. "
+    "Respond ONLY with a valid JSON object — no markdown fences, no prose outside the JSON."
+)
+
+_BREAKDOWN_USER_TEMPLATE = """\
+## Patient Profile
+{patient_summary}
+
+## Task
+Evaluate every numbered criterion below against the patient profile.
+
+Return a JSON object with a single key "breakdown" whose value is an array. \
+Each array element must have EXACTLY these fields:
+{{
+  "n":       <criterion number as integer>,
+  "type":    <"inclusion" or "exclusion">,
+  "verdict": <"met" | "not_met" | "unknown">,
+  "reason":  "<one concise sentence grounded in the patient data>"
+}}
+
+Use "unknown" only when the patient record genuinely lacks the data needed to decide.
+
+## Eligibility Criteria
+{criteria_list}
+"""
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -100,6 +132,50 @@ async def assess_eligibility(bundle: dict, trial: dict) -> dict:
         return _error_result(str(exc))
 
     return _parse_response(raw_text)
+
+
+async def breakdown_eligibility(bundle: dict, trial: dict) -> list[dict]:
+    """
+    Return a per-criterion eligibility breakdown for one trial against a patient bundle.
+
+    Each item: {n, type, criterion, verdict, reason}
+    """
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        return [{"error": "GROQ_API_KEY not set"}]
+
+    raw_criteria = _split_criteria(trial.get("eligibility_criteria", ""))
+    if not raw_criteria:
+        return []
+
+    criteria_to_eval = raw_criteria[:_MAX_CRITERIA_COUNT]
+    criteria_list = "\n".join(
+        f"{i + 1}. [{c['type'].upper()}] {c['text']}"
+        for i, c in enumerate(criteria_to_eval)
+    )
+
+    prompt = _BREAKDOWN_USER_TEMPLATE.format(
+        patient_summary=_patient_summary(bundle),
+        criteria_list=criteria_list,
+    )
+
+    try:
+        async with _call_lock:
+            async with AsyncOpenAI(base_url=GROQ_BASE_URL, api_key=api_key, timeout=120.0) as client:
+                resp = await client.chat.completions.create(
+                    model=GROQ_MODEL,
+                    messages=[
+                        {"role": "system", "content": _BREAKDOWN_SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt},
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0.1,
+                )
+        raw_text = resp.choices[0].message.content or ""
+    except Exception as exc:  # noqa: BLE001
+        return [{"error": str(exc)}]
+
+    return _parse_breakdown(raw_text, criteria_to_eval)
 
 
 # ── Patient summary builder ───────────────────────────────────────────────────
@@ -208,6 +284,83 @@ def _patient_summary(bundle: dict) -> str:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _split_criteria(text: str) -> list[dict]:
+    """
+    Parse a ClinicalTrials.gov eligibility criteria block into a flat list of
+    {type, text} dicts.  Handles both bullet (* / - / •) and numbered (1. / 1))
+    formats and joins wrapped continuation lines.
+    """
+    criteria: list[dict] = []
+    current_type = "inclusion"
+    current_text: str | None = None
+
+    _BULLET = re.compile(r'^[\*\-•]\s+|^\d+[.)]\s+')
+    _HEADER = re.compile(r'(inclusion|exclusion)\s+criteria', re.IGNORECASE)
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        header_match = _HEADER.search(line)
+        if header_match:
+            if current_text:
+                criteria.append({"type": current_type, "text": current_text.strip()})
+                current_text = None
+            current_type = "inclusion" if "inclusion" in header_match.group(0).lower() else "exclusion"
+            continue
+
+        if _BULLET.match(line):
+            if current_text:
+                criteria.append({"type": current_type, "text": current_text.strip()})
+            current_text = _BULLET.sub("", line).strip()
+        elif current_text is not None:
+            # continuation of the previous criterion
+            current_text += " " + line
+        # else: preamble text before first bullet — skip
+
+    if current_text:
+        criteria.append({"type": current_type, "text": current_text.strip()})
+
+    return [c for c in criteria if len(c["text"]) > 10]
+
+
+def _parse_breakdown(raw: str, criteria: list[dict]) -> list[dict]:
+    """Merge the LLM's per-criterion verdicts back with the original criterion text."""
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[a-zA-Z]*\n?", "", raw)
+        raw = re.sub(r"\n?```$", "", raw.strip())
+
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return [{"error": f"Could not parse breakdown JSON: {raw[:200]}"}]
+
+    items = payload.get("breakdown") or payload.get("criteria") or []
+    if not isinstance(items, list):
+        return [{"error": "Unexpected breakdown format from model"}]
+
+    result = []
+    for item in items:
+        n = int(item.get("n", 0))
+        idx = n - 1
+        criterion_text = criteria[idx]["text"] if 0 <= idx < len(criteria) else item.get("criterion", "")
+        ctype = item.get("type") or (criteria[idx]["type"] if 0 <= idx < len(criteria) else "unknown")
+        verdict = item.get("verdict", "unknown")
+        if verdict not in _VALID_BREAKDOWN_VERDICTS:
+            verdict = "unknown"
+        result.append({
+            "n": n,
+            "type": ctype,
+            "criterion": criterion_text,
+            "verdict": verdict,
+            "reason": str(item.get("reason", "")),
+        })
+
+    return sorted(result, key=lambda x: x["n"])
+
 
 def _first_display(coding_list: list[dict]) -> str:
     for coding in coding_list:
