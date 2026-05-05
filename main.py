@@ -18,12 +18,12 @@ mcp = FastMCP("clinical-trial-matcher")
 # can inject FHIR context via HTTP headers instead of requiring explicit params.
 
 _FHIR_SCOPES = [
-    "patient/Patient.rs",
-    "patient/Condition.rs",
-    "patient/Observation.rs",
-    "patient/MedicationRequest.rs",
-    "patient/AllergyIntolerance.rs",
-    "patient/Procedure.rs",
+    {"name": "patient/Patient.rs", "required": True},
+    {"name": "patient/Condition.rs", "required": True},
+    {"name": "patient/Observation.rs", "required": True},
+    {"name": "patient/MedicationRequest.rs", "required": True},
+    {"name": "patient/AllergyIntolerance.rs", "required": True},
+    {"name": "patient/Procedure.rs", "required": True},
 ]
 
 _orig_get_caps = mcp._mcp_server.get_capabilities
@@ -31,10 +31,10 @@ _orig_get_caps = mcp._mcp_server.get_capabilities
 
 def _get_caps_with_fhir(notification_options, experimental_capabilities):
     caps = _orig_get_caps(notification_options, experimental_capabilities)
-    existing = caps.experimental or {}
-    caps.experimental = {
+    existing = getattr(caps, "extensions", None) or {}
+    caps.extensions = {
         **existing,
-        "ai.promptopinion/fhir-context": {"requiredScopes": _FHIR_SCOPES},
+        "ai.promptopinion/fhir-context": {"scopes": _FHIR_SCOPES},
     }
     return caps
 
@@ -249,5 +249,20 @@ def _bundle_summary(bundle: dict) -> dict:
 
 
 if __name__ == "__main__":
+    from starlette.middleware import Middleware
+    from starlette.middleware.cors import CORSMiddleware
+
     port = int(os.environ.get("PORT", 8000))
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=port)
+    mcp.run(
+        transport="streamable-http",
+        host="0.0.0.0",
+        port=port,
+        middleware=[
+            Middleware(
+                CORSMiddleware,
+                allow_origins=["*"],
+                allow_methods=["*"],
+                allow_headers=["*"],
+            ),
+        ],
+    )
